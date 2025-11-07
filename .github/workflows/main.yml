@@ -1,0 +1,64 @@
+name: Run EMR Serverless (amazon_purchase_analysis)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Start job
+        id: start
+        run: |
+          ENTRY="s3://amzn-emr-spark/scripts/amazon_purchase_analysis_spark3.py"
+          ARG1="s3://amzn-emr-spark/data/input/"
+          ARG2="s3://amzn-emr-spark/data/output_csv_spark3/"
+
+          JOB_JSON=$(aws emr-serverless start-job-run \
+            --application-id "${{ secrets.EMR_SERVERLESS_APP_ID }}" \
+            --execution-role-arn "${{ secrets.EMR_EXEC_ROLE_ARN }}" \
+            --name "gh-${{ github.run_id }}" \
+            --job-driver "{
+              \"sparkSubmit\": {
+                \"entryPoint\": \"$ENTRY\",
+                \"entryPointArguments\": [\"$ARG1\",\"$ARG2\"],
+                \"sparkSubmitParameters\": \"--conf spark.executor.instances=2 --conf spark.executor.memory=2G --conf spark.executor.cores=2 --conf spark.driver.memory=2G\"
+              }
+            }" \
+            --configuration-overrides "{
+              \"monitoringConfiguration\": {
+                \"s3MonitoringConfiguration\": {\"logUri\": \"s3://amzn-emr-spark/logs/\"}
+              }
+            }")
+
+          echo "$JOB_JSON"
+          echo "JOB_RUN_ID=$(echo "$JOB_JSON" | jq -r .jobRunId)" >> $GITHUB_OUTPUT
+
+      - name: Wait for completion
+        run: |
+          APP="${{ secrets.EMR_SERVERLESS_APP_ID }}"
+          JR="${{ steps.start.outputs.JOB_RUN_ID }}"
+          echo "Waiting for job run: $JR"
+          while true; do
+            ST=$(aws emr-serverless get-job-run --application-id "$APP" --job-run-id "$JR" --query 'jobRun.state' --output text)
+            echo "State: $ST"
+            case "$ST" in
+              SUCCESS) exit 0 ;;
+              FAILED|CANCELLED|CANCELLING)
+                echo "Job failed: $ST"
+                aws emr-serverless get-job-run --application-id "$APP" --job-run-id "$JR" --output json
+                exit 1
+                ;;
+              *) sleep 20 ;;
+            esac
+          done
